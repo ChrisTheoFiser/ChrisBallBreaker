@@ -1,0 +1,512 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8" />
+<meta name="viewport" content="width=device-width, initial-scale=1, viewport-fit=cover" />
+<title>Chris's Ball Breakers</title>
+<style>
+  :root { --fg:#fff; --bg:#0a0a0a; }
+  html, body { margin:0; height:100%; background:var(--bg); color:var(--fg); font-family: system-ui, -apple-system, Segoe UI, Roboto, Arial, sans-serif; }
+  #wrap { position:fixed; inset:0; display:grid; place-items:center; }
+  canvas { background:#1a1a1a; image-rendering: pixelated; image-rendering: crisp-edges; touch-action: none; }
+  #hud {
+    position: fixed; inset: 0; pointer-events: none;
+    display: grid; grid-template-rows: auto 1fr auto; padding: env(safe-area-inset-top) 12px env(safe-area-inset-bottom) 12px;
+  }
+  #topbar { display:flex; gap:12px; align-items:center; justify-content:space-between; padding-top:6px; }
+  #stats { font-weight:700; text-shadow:0 1px 2px #000; font-size: clamp(12px, 2.4vw, 16px); }
+  #msg {
+    place-self:center; max-width: min(720px, 92vw); text-align:center; pointer-events:auto;
+    background: rgba(0,0,0,.65); border:1px solid rgba(255,255,255,.18); border-radius:12px; padding:14px 16px; display:none;
+  }
+  button {
+    pointer-events:auto; appearance:none; border:1px solid #333; background:#111; color:#fff; padding:10px 14px; border-radius:10px; font-weight:700; cursor:pointer;
+  }
+  button:active { transform: translateY(1px); }
+  #controls { font-size: clamp(11px, 2.2vw, 14px); opacity:.9; }
+  #touchBar {
+    position: fixed; left:0; right:0; bottom:0; pointer-events:auto; display:flex; gap:10px; justify-content:center; padding: 12px;
+  }
+  .touchBtn {
+    flex:0 0 auto; min-width: 120px; max-width: 40vw; height: 48px; border-radius: 999px;
+    display:flex; align-items:center; justify-content:center; border:1px solid #333; background:#151515; color:#fff; font-weight:900; letter-spacing:.4px;
+  }
+  @media (min-width: 820px) {
+    #touchBar { display:none; }
+  }
+</style>
+</head>
+<body>
+<div id="wrap">
+  <canvas id="game" width="960" height="540" aria-label="Chris's Ball Breakers"></canvas>
+  <div id="hud">
+    <div id="topbar">
+      <div id="stats">Dist 0m • Speed 0 • Lives 3 • CP 0m • Best 0m</div>
+      <div id="controls">Tap/⎵/W/↑: Jump • P: Pause • R: Reset Save • Enter: Start/Continue • M: Mute</div>
+    </div>
+    <div></div>
+    <div id="msg">
+      <h2 id="title">Chris's Ball Breakers</h2>
+      <p id="subtitle">Chrome-Dino energy, but way more… biological. Mobile-ready. Progress auto-saves.</p>
+      <div style="display:flex; gap:8px; justify-content:center; margin-top:8px; flex-wrap:wrap;">
+        <button id="startBtn">Start</button>
+        <button id="resumeBtn" style="display:none;">Resume from Checkpoint</button>
+        <button id="resetBtn">Reset Save</button>
+        <button id="muteBtn">Mute</button>
+      </div>
+      <p style="opacity:.8; font-size: 13px; margin-top:10px;">Tip: Add to Home Screen for fullscreen play.</p>
+    </div>
+  </div>
+  <div id="touchBar">
+    <div class="touchBtn" id="jumpBtn">JUMP</div>
+  </div>
+</div>
+
+<script>
+(() => {
+  // ====== Helpers ============================================================
+  const clamp = (v,a,b)=>Math.max(a,Math.min(b,v));
+  const rand = (a,b)=>a + Math.random()*(b-a);
+  const randi = (a,b)=>Math.floor(rand(a,b+1));
+  const chance = p => Math.random() < p;
+  const lerp = (a,b,t)=>a + (b-a)*t;
+
+  // ====== Save ===============================================================
+  const SAVE_KEY = 'cbb_save_v1';
+  const loadSave = () => { try { return JSON.parse(localStorage.getItem(SAVE_KEY)||'{}'); } catch { return {}; } };
+  const writeSave = (d) => localStorage.setItem(SAVE_KEY, JSON.stringify(d));
+  const resetSave = () => localStorage.removeItem(SAVE_KEY);
+
+  // ====== Canvas & Resize ====================================================
+  const canvas = document.getElementById('game');
+  const ctx = canvas.getContext('2d');
+  let DPR = Math.max(1, Math.min(window.devicePixelRatio||1, 2));
+  function fit() {
+    DPR = Math.max(1, Math.min(window.devicePixelRatio||1, 2));
+    const targetW = 960, targetH = 540;
+    const w = window.innerWidth, h = window.innerHeight;
+    let scale = Math.min(w/targetW, h/targetH);
+    scale = Math.max(0.5, Math.min(scale, 2.5));
+    canvas.style.width = (targetW*scale) + 'px';
+    canvas.style.height = (targetH*scale) + 'px';
+  }
+  window.addEventListener('resize', fit); fit();
+
+  const W = canvas.width, H = canvas.height;
+  const GROUND_Y = Math.floor(H*0.78);
+
+  // ====== Audio (WebAudio) ===================================================
+  const audio = {
+    ctx:null, master:null, bpm:132, seqT:0, playing:false, musicOn:true, patIdx:0,
+    init(){ if(this.ctx) return; this.ctx = new (window.AudioContext||window.webkitAudioContext)(); this.master = this.ctx.createGain(); this.master.gain.value = 0.17; this.master.connect(this.ctx.destination); },
+    toggle(){ if(!this.ctx) this.init(); this.musicOn = !this.musicOn; if(this.musicOn) this.start(); else this.stop(); },
+    start(){ if(!this.ctx) this.init(); this.seqT = this.ctx.currentTime; this.playing = true; },
+    stop(){ this.playing=false; },
+    tick(){
+      if(!this.playing || !this.musicOn) return;
+      const now = this.ctx.currentTime;
+      while(this.seqT < now + 0.1){
+        this.beat(this.seqT);
+        this.seqT += (60/this.bpm)/2; // 8th notes
+      }
+    },
+    // Background groove + hats
+    beat(t){
+      const chords=[[60,64,67],[62,65,69],[59,62,67],[57,60,64]];
+      this.patIdx = (this.patIdx+1)%(chords.length*4);
+      const ch = chords[Math.floor(this.patIdx/4)], step=this.patIdx%4;
+      const notes=[ch[step%3],ch[(step+1)%3]];
+      notes.forEach((n,i)=>this.blip(t + i*0.02, n+12, 0.07, 0.32, 'triangle'));
+      if(step%2===0) this.blip(t, ch[0]-12, 0.12, 0.25, 'square'); // bass
+      this.noise(t, 0.02, 0.12);
+    },
+    // One-off riff (guitar with wings)
+    riff(){
+      if(!this.ctx || !this.musicOn) return;
+      const t = this.ctx.currentTime + 0.02;
+      const seq = [72,74,76,79,76,74,72, 72,67,69,72];
+      seq.forEach((m,i)=>this.blip(t+i*0.06, m, 0.09, 0.45, 'square'));
+    },
+    sfx(name){
+      if(!this.ctx || !this.musicOn) return;
+      const t=this.ctx.currentTime;
+      if(name==='jump') this.blip(t, 76, 0.09, 0.42, 'square');
+      if(name==='slip') this.blip(t, 50, 0.08, 0.35, 'square');
+      if(name==='hit')  this.blip(t, 40, 0.14, 0.45, 'square');
+      if(name==='cp')   this.blip(t, 84, 0.18, 0.5, 'triangle');
+      if(name==='beer') this.blip(t, 67, 0.16, 0.5, 'square');
+      if(name==='lick') this.blip(t, 90, 0.1, 0.38, 'triangle');
+      if(name==='pooped') this.noise(t, 0.12, 0.25);
+    },
+    blip(t, midi, dur, vol, type='triangle'){
+      const o=this.ctx.createOscillator(), g=this.ctx.createGain();
+      o.type=type; o.frequency.value = 440*Math.pow(2,(midi-69)/12);
+      g.gain.setValueAtTime(0, t);
+      g.gain.linearRampToValueAtTime(vol, t+0.01);
+      g.gain.exponentialRampToValueAtTime(0.0001, t+dur);
+      o.connect(g); g.connect(this.master); o.start(t); o.stop(t+dur+0.05);
+    },
+    noise(t,dur,vol){
+      const nSamp=Math.floor(0.05*this.ctx.sampleRate);
+      const buf=this.ctx.createBuffer(1,nSamp,this.ctx.sampleRate);
+      const data=buf.getChannelData(0); for(let i=0;i<nSamp;i++) data[i]=Math.random()*2-1;
+      const src=this.ctx.createBufferSource(); src.buffer=buf;
+      const g=this.ctx.createGain(); g.gain.value=vol; src.connect(g); g.connect(this.master);
+      src.start(t); src.stop(t+dur);
+    }
+  };
+
+  // ====== Input ==============================================================
+  const keys={};
+  window.addEventListener('keydown',(e)=>{
+    keys[e.key.toLowerCase()]=true;
+    if([' ','w','arrowup'].includes(e.key.toLowerCase())) e.preventDefault();
+    if(!started && e.key==='Enter') showMenu(false);
+    if(e.key.toLowerCase()==='p') togglePause();
+    if(e.key.toLowerCase()==='r'){ resetSave(); flash('Save cleared'); resumeBtn.style.display='none'; }
+    if(e.key.toLowerCase()==='m'){ audio.toggle(); muteBtn.textContent = audio.musicOn ? 'Mute' : 'Unmute'; }
+  });
+  window.addEventListener('keyup',(e)=>keys[e.key.toLowerCase()]=false);
+
+  // Touch jump
+  const jumpBtn = document.getElementById('jumpBtn');
+  const tap = () => player.jump();
+  jumpBtn.addEventListener('pointerdown', tap);
+  canvas.addEventListener('pointerdown', tap);
+
+  // ====== State ==============================================================
+  let running=false, paused=false, started=false;
+  const state = { dist:0, speed:6, lives:3, slipT:0, invT:0, bigT:0, checkpoint:0, best:0, zoneT:0 };
+  // Load save
+  { const s=loadSave(); state.best = s.best||0; if(s.checkpoint){ state.checkpoint=s.checkpoint|0; document.getElementById('resumeBtn').style.display='inline-block'; } }
+
+  const player = { x:140, y:GROUND_Y, vy:0, w:32, h:28, onGround:true, jump() {
+      if(this.onGround){ this.vy = state.bigT>0 ? -18 : -14; this.onGround=false; audio.sfx('jump'); }
+    }
+  };
+
+  const HAZ = []; // hazards & goodies
+  const T_POOP='poop', T_KNIFE='knife', T_BAL='balloon', T_BUB='bubble', T_STROLLER='stroller', T_BEER='beer', T_SHRIMP='shrimp', T_GUITAR='guitar', T_CHIMMY='chimmy';
+
+  // ====== Spawners ===========================================================
+  function spawn(){
+    const sp = 1 + Math.min(2.2, state.dist/1500);
+    if(chance(0.018*sp)) HAZ.push(makePoop());
+    if(chance(0.012*sp)) HAZ.push(makeKnife());
+    if(chance(0.010*sp)) HAZ.push(makeBalloon());
+    if(chance(0.010*sp)) HAZ.push(makeBubble());
+    if(chance(0.010*sp)) HAZ.push(makeStroller());
+    if(chance(0.008))    HAZ.push(makeBeer());
+    if(chance(0.010))    HAZ.push(makeShrimp());
+    if(chance(0.004))    { HAZ.push(makeGuitar()); audio.riff(); }
+    // Chimmy runs by occasionally, non-interactive
+    if(!HAZ.some(h=>h.type===T_CHIMMY) && chance(0.003)) HAZ.push(makeChimmy());
+  }
+  function makePoop(){ return {type:T_POOP, x:W+40, y:GROUND_Y-16, w:22, h:16}; }
+  function makeKnife(){ return {type:T_KNIFE, x:randi(W*0.6,W+120), y:-28, w:16, h:28, vy:rand(5,9)}; }
+  function makeBalloon(){ return {type:T_BAL, x:W+40, y:GROUND_Y-randi(60,160), w:20,h:20, vx:rand(-7,-5), bob:Math.random()*Math.PI*2}; }
+  function makeBubble(){ return {type:T_BUB, x:W+40, y:GROUND_Y-randi(30,130), w:16,h:16, vx:rand(-6,-4), vy:rand(-2,2)}; }
+  function makeStroller(){ return {type:T_STROLLER, x:W+40, y:GROUND_Y-18, w:30, h:18}; }
+  function makeBeer(){ return {type:T_BEER, x:W+40, y:GROUND_Y-36, w:16, h:28, vx:rand(-6.5,-5.5), bob:Math.random()*Math.PI*2}; }
+  function makeShrimp(){ return {type:T_SHRIMP, x:randi(40,W-40), y:-28, w:14, h:18, vy:rand(3.4,5.2)}; }
+  function makeGuitar(){ return {type:T_GUITAR, x:W+20, y:GROUND_Y-randi(160,250), w:28, h:18, vx:rand(-5.5,-4.5), bob:Math.random()*Math.PI*2}; }
+  function makeChimmy(){ return {type:T_CHIMMY, x:-60, y:GROUND_Y-14, w:24, h:14, vx:rand(3.5,4.5), poopCd:0, mode:'run'}; }
+
+  // ====== Collision ==========================================================
+  const aabb = (a,b)=> a.x < b.x + b.w && a.x + a.w > b.x && a.y < b.y + b.h && a.y + a.h > b.y;
+
+  // ====== UI ================================================================
+  const statsEl=document.getElementById('stats');
+  const msg=document.getElementById('msg');
+  const titleEl=document.getElementById('title');
+  const subtitleEl=document.getElementById('subtitle');
+  const startBtn=document.getElementById('startBtn');
+  const resumeBtn=document.getElementById('resumeBtn');
+  const resetBtn=document.getElementById('resetBtn');
+  const muteBtn=document.getElementById('muteBtn');
+
+  function showMenu(show=true, reason=''){
+    started=!show; msg.style.display=show?'block':'none';
+    if(show){ running=false; titleEl.textContent = reason||"Chris's Ball Breakers"; }
+  }
+  function flash(text){ subtitleEl.textContent=text; msg.style.display='block'; setTimeout(()=>{ if(started) msg.style.display='none'; }, 900); }
+
+  startBtn.onclick=()=> startGame();
+  resumeBtn.onclick=()=> { const s=loadSave(); startGame(s.checkpoint||0, true); };
+  resetBtn.onclick=()=> { resetSave(); flash('Save cleared'); resumeBtn.style.display='none'; };
+  muteBtn.onclick=()=> { audio.toggle(); muteBtn.textContent = audio.musicOn ? 'Mute' : 'Unmute'; };
+
+  function togglePause(){ if(!started) return; paused=!paused; if(paused) showMenu(true,'Paused'); else showMenu(false); }
+
+  function startGame(fromCP=0, resume=false){
+    audio.init(); if(audio.musicOn) audio.start();
+    started=true; paused=false; running=true; msg.style.display='none';
+    state.dist=fromCP; state.speed=6 + (fromCP/300)*0.9; state.lives=resume?(loadSave().lives||3):3;
+    state.slipT=0; state.invT=0; state.bigT=0; state.zoneT = fromCP/1200;
+    HAZ.length=0;
+    player.x=140; player.y=GROUND_Y; player.vy=0; player.onGround=true;
+    for(let i=0;i<22;i++) spawn();
+    updateStats();
+  }
+
+  // ====== Drawing helpers (chunky pixels) ===================================
+  function px(x,y,w,h,c){ ctx.fillStyle=c; ctx.fillRect(Math.round(x),Math.round(y),Math.round(w),Math.round(h)); }
+
+  function drawBackground(){
+    // day/sunset/night/rainbow cycle
+    state.zoneT += 0.002;
+    const t = state.zoneT%4;
+    let skyTop, skyBot;
+    if(t<1){ skyTop='#6ad0ff'; skyBot='#d1f3ff'; }
+    else if(t<2){ skyTop='#ff8a66'; skyBot='#ffe0c2'; }
+    else if(t<3){ skyTop='#0b0b2e'; skyBot='#111144'; }
+    else { skyTop='#ff7cf3'; skyBot='#7cfff6'; }
+    const g=ctx.createLinearGradient(0,0,0,H);
+    g.addColorStop(0,skyTop); g.addColorStop(1,skyBot); ctx.fillStyle=g; ctx.fillRect(0,0,W,H);
+
+    // parallax mountains
+    ctx.fillStyle='#334';
+    for(let i=0;i<6;i++){
+      const x=(i*220 - (state.dist*0.2)%220) - 60;
+      ctx.beginPath(); ctx.moveTo(x,GROUND_Y); ctx.lineTo(x+110,GROUND_Y-80); ctx.lineTo(x+220,GROUND_Y); ctx.closePath(); ctx.fill();
+    }
+    // ground + rainbow stripes
+    px(0,GROUND_Y,W,H-GROUND_Y,'#2b2b2b');
+    for(let i=0;i<8;i++){ const y=GROUND_Y+4+i*8; px(0,y,W,2,`hsl(${(state.dist*0.2 + i*40)%360} 90% 55%)`); }
+  }
+
+  function drawPlayer(){
+    const x=player.x, y=player.y;
+    const base='#6adf5f', dark='#3f9a35';
+    // body
+    px(x, y-24, 28, 24, base); px(x+4,y-26,20,6,base); px(x+2,y-10,24,12,dark);
+    // face
+    px(x+8,y-18,4,6,'#000'); px(x+16,y-18,4,6,'#000'); px(x+9,y-17,2,2,'#fff'); px(x+17,y-17,2,2,'#fff');
+    px(x+10,y-10,8,2,'#000'); // smile
+    // afro
+    const afroBounce=Math.sin((state.dist + y)*0.05)*2;
+    for(let i=0;i<5;i++){ px(x-2+i*6, y-32+afroBounce,6,6,'#ff6ac1'); px(x+1+i*6,y-36+afroBounce,6,6,'#ff8bd3'); }
+    // rigid pink tail
+    px(x+26, y-16, 18, 6, '#f98ad5'); px(x+27,y-18,16,2,'#ffc3ec'); px(x+27,y-10,16,2,'#e66fc0');
+    // gross accents
+    px(x+2,y-8,4,4,'#2f6c2a'); px(x+20,y-6,3,3,'#2f6c2a');
+    // feet
+    const walk = player.onGround ? Math.sin(state.dist*0.2) : 0;
+    px(x+6,y,8,4,'#1c1c1c'); px(x+14,y,8,4,'#1c1c1c');
+    px(x+6,y+Math.sign(walk),8,2,'#000'); px(x+14,y-Math.sign(walk),8,2,'#000');
+
+    // powerup visuals
+    if(state.invT>0){ ctx.globalAlpha=0.35; px(x-6,y-34,40,44,'#aaf'); ctx.globalAlpha=1; }
+    if(state.bigT>0){ ctx.globalAlpha=0.25; px(x-10,y-38,48,50,'#fa5'); ctx.globalAlpha=1; }
+  }
+
+  function drawPoop(h){
+    const x=h.x,y=h.y;
+    px(x,y+10,20,6,'#5a3a1f'); px(x+3,y+6,14,6,'#6e4a29'); px(x+6,y+2,8,6,'#7a552f');
+    px(x+8,y+6,2,2,'#000'); px(x+12,y+6,2,2,'#000'); px(x+9,y+8,4,2,'#000');
+  }
+  function drawKnife(h){ const x=h.x,y=h.y; px(x,y,4,20,'#cfcfcf'); px(x-2,y+20,8,6,'#999'); px(x,y+26,4,6,'#333'); }
+  function drawBalloon(h){ const x=h.x,y=h.y; px(x,y,18,18,'#f85959'); px(x+7,y+18,4,4,'#a82424'); for(let i=0;i<5;i++) px(x+8,y+22+i*2,2,1,'#222'); }
+  function drawBubble(h){ const x=h.x,y=h.y; px(x,y,16,16,'#68ffd6'); px(x+3,y+3,5,5,'#b2fff1'); px(x+10,y+10,3,3,'#2fbfa2'); }
+  function drawStroller(h){ const x=h.x,y=h.y; // body
+    px(x,y,28,12,'#554'); px(x+4,y-6,20,6,'#776'); // handle bar
+    px(x-6,y-2,6,2,'#444');
+    // wheels
+    px(x+2,y+12,6,6,'#000'); px(x+20,y+12,6,6,'#000'); px(x+3,y+13,4,4,'#666'); px(x+21,y+13,4,4,'#666');
+  }
+  function drawBeer(h){ const x=h.x,y=h.y; px(x,y,12,22,'#2b1b12'); px(x-2,y-4,16,6,'#d4af37'); px(x+2,y+2,8,10,'#3a2318'); }
+  function drawShrimp(h){ const x=h.x,y=h.y; px(x,y,14,10,'#f8a8a0'); px(x+2,y+2,10,6,'#fcd0c8'); px(x+12,y+4,2,6,'#f08980'); }
+  function drawGuitar(h){ const x=h.x,y=h.y; // wings
+    px(x-12,y+2,10,6,'#ddd'); px(x-12,y,10,2,'#fff'); px(x+30,y+2,10,6,'#ddd'); px(x+30,y,10,2,'#fff');
+    // body + neck
+    px(x,y,10,16,'#b5651d'); px(x+10,y+4,12,12,'#a04b0e'); px(x-2,y+6,2,8,'#333');
+  }
+  function drawChimmy(h){ const x=h.x,y=h.y;
+    // body
+    px(x,y-10,18,10,'#d9c2a6'); // beige
+    // head
+    px(x-4,y-16,12,8,'#e5d1bb'); px(x+4,y-14,6,6,'#e5d1bb');
+    // ears
+    px(x-6,y-16,4,4,'#b48a6a'); px(x+10,y-16,4,4,'#b48a6a');
+    // face
+    px(x-2,y-14,2,2,'#000'); px(x+4,y-14,2,2,'#000');
+    // legs
+    px(x+2,y,4,4,'#8a735d'); px(x+12,y,4,4,'#8a735d');
+    // comedic… accessories (non-sexual, exaggerated)
+    px(x+8,y,6,3,'#b58'); // cartoony "dragging" blob
+  }
+
+  // ====== Checkpoints ========================================================
+  const CP_INTERVAL = 300;
+  function maybeCheckpoint(){
+    const next = Math.floor(state.dist/CP_INTERVAL)*CP_INTERVAL;
+    if(next>state.checkpoint){
+      state.checkpoint = next; audio.sfx('cp'); flash(`Checkpoint: ${next} m`);
+      // Chimmy runs back to lick (cute overlay)
+      HAZ.push({type:'event_lick', t:0, dur:90});
+      writeSave({checkpoint:state.checkpoint, best:Math.max(state.best,state.checkpoint), lives:state.lives});
+      document.getElementById('resumeBtn').style.display='inline-block';
+    }
+  }
+
+  // ====== Stats UI ===========================================================
+  function updateStats(){
+    statsEl.textContent = `Dist ${Math.floor(state.dist)}m • Speed ${state.speed.toFixed(1)} • Lives ${state.lives} • CP ${state.checkpoint}m • Best ${state.best}m`;
+  }
+
+  // ====== Loop ===============================================================
+  let last=0;
+  function loop(ts){
+    requestAnimationFrame(loop);
+    const dt = Math.min(32, ts - last || 16); last = ts;
+    if(!running || paused) return;
+
+    audio.tick();
+
+    const targetSpeed = 6 + Math.min(16, state.dist/180);
+    state.speed = lerp(state.speed, targetSpeed, 0.005);
+
+    // Input
+    if(keys[' ']||keys['w']||keys['arrowup']) player.jump();
+
+    // Physics
+    player.vy += 0.7;
+    player.y += player.vy;
+    if(player.y >= GROUND_Y){ player.y=GROUND_Y; player.vy=0; player.onGround=true; } else player.onGround=false;
+
+    // Power timers
+    if(state.slipT>0) state.slipT -= dt/1000;
+    if(state.invT>0) state.invT -= dt/1000;
+    if(state.bigT>0) state.bigT -= dt/1000;
+
+    const worldSpeed = state.speed * (state.slipT>0 ? 0.65 : 1);
+    state.dist += worldSpeed * 0.4;
+
+    spawn();
+
+    // Move/render
+    drawBackground();
+
+    for(let i=HAZ.length-1;i>=0;i--){
+      const h=HAZ[i];
+
+      // events
+      if(h.type==='event_lick'){
+        h.t += 1;
+        // tiny heart near player
+        if(h.t< h.dur){
+          const a = 1 - h.t/h.dur;
+          ctx.globalAlpha = a;
+          px(player.x-10, player.y-40, 6,6,'#ff8bb0'); px(player.x-4, player.y-46, 6,6,'#ff8bb0');
+          ctx.globalAlpha = 1;
+          if(h.t===1) audio.sfx('lick');
+        } else { HAZ.splice(i,1); }
+        continue;
+      }
+      if(h.type==='event_pooped'){
+        h.t += 1;
+        if(h.t< h.dur){
+          const a = 1 - h.t/h.dur;
+          ctx.globalAlpha = a;
+          drawPoop({x:player.x+6, y:player.y-36, w:20, h:12});
+          ctx.globalAlpha = 1;
+        } else { HAZ.splice(i,1); }
+        continue;
+      }
+
+      // per-type motion + draw + collision
+      if(h.type===T_POOP){
+        h.x -= worldSpeed; drawPoop(h);
+        if(aabb({x:player.x+2,y:player.y-24,w:26,h:24},h) && state.invT<=0){ state.slipT=1.8; audio.sfx('slip'); HAZ.splice(i,1); continue; }
+      } else if(h.type===T_KNIFE){
+        h.y += h.vy; drawKnife(h);
+        if(aabb({x:player.x+2,y:player.y-26,w:26,h:26},h)){ hit(); HAZ.splice(i,1); continue; }
+      } else if(h.type===T_BAL){
+        h.bob += 0.08; h.y += Math.sin(h.bob)*0.6; h.x += h.vx; drawBalloon(h);
+        if(aabb({x:player.x+4,y:player.y-26,w:24,h:24},h)){ hit(); HAZ.splice(i,1); continue; }
+      } else if(h.type===T_BUB){
+        h.x += h.vx; h.y += h.vy; h.vy += Math.sin(h.x*0.02)*0.08; drawBubble(h);
+        if(aabb({x:player.x+6,y:player.y-26,w:20,h:24},h) && state.invT<=0){ state.slipT=Math.max(state.slipT,1.0); HAZ.splice(i,1); continue; }
+      } else if(h.type===T_STROLLER){
+        h.x -= worldSpeed*0.95; drawStroller(h);
+        if(aabb({x:player.x+2,y:player.y-24,w:26,h:24},h)){ hit(); HAZ.splice(i,1); continue; }
+      } else if(h.type===T_BEER){
+        h.bob += 0.1; h.y += Math.sin(h.bob)*0.6; h.x += (h.vx||-6); drawBeer(h);
+        if(aabb({x:player.x+2,y:player.y-26,w:26,h:26},h)){
+          // random effect
+          audio.sfx('beer');
+          const pick = Math.random();
+          if(pick<0.34){ state.lives++; flash('Extra life!'); }
+          else if(pick<0.67){ state.invT = 6; flash('Indestructible!'); }
+          else { state.bigT = 6; flash('BIG MODE! Higher jumps, smash hazards.'); }
+          HAZ.splice(i,1); continue;
+        }
+      } else if(h.type===T_SHRIMP){
+        h.y += h.vy; drawShrimp(h);
+        if(aabb({x:player.x+2,y:player.y-26,w:26,h:26},h)){
+          state.dist += 20; // tiny score bump
+          state.slipT = Math.max(0, state.slipT - 0.6); // cleans you up
+          HAZ.splice(i,1); continue;
+        }
+      } else if(h.type===T_GUITAR){
+        h.bob += 0.1; h.y += Math.sin(h.bob)*0.6; h.x += h.vx; drawGuitar(h);
+        // background only
+      } else if(h.type===T_CHIMMY){
+        // Chimmy runs and leaves occasional tiny poops
+        h.x += h.vx; drawChimmy(h);
+        h.poopCd -= 1;
+        if(h.poopCd<=0){ h.poopCd = randi(30,80); HAZ.push({type:T_POOP, x:h.x-4, y:GROUND_Y-16, w:22, h:16}); }
+      }
+
+      if(h.x + (h.w||0) < -60 || h.y > H+80) HAZ.splice(i,1);
+    }
+
+    // Player draw after hazards for layering
+    drawPlayer();
+
+    // BIG MODE smashing effect: remove contact hazards
+    if(state.bigT>0){
+      for(let i=HAZ.length-1;i>=0;i--){
+        const h=HAZ[i];
+        if([T_STROLLER,T_BAL,T_KNIFE,T_BUB].includes(h.type)){
+          if(aabb({x:player.x+0,y:player.y-28,w:32,h:28},h)){
+            // smash visual
+            px(h.x, h.y, (h.w||16), (h.h||16), '#fff');
+            HAZ.splice(i,1);
+          }
+        }
+      }
+    }
+
+    maybeCheckpoint();
+    state.best = Math.max(state.best, Math.floor(state.dist));
+    updateStats();
+
+    // Persist
+    writeSave({checkpoint:state.checkpoint, best:state.best, lives:state.lives});
+  }
+
+  function hit(){
+    if(state.invT>0){ return; }
+    audio.sfx('hit');
+    if(state.bigT>0){ state.bigT=0; return; } // lose big mode first
+    state.lives--;
+    if(state.lives<=0){
+      running=false;
+      // Chimmy revenge: poop on head
+      audio.sfx('pooped'); HAZ.push({type:'event_pooped', t:0, dur:100});
+      showMenu(true, `You died at ${Math.floor(state.dist)} m • Best ${state.best} m`);
+    } else {
+      state.slipT = Math.max(state.slipT, 0.8);
+      flash(`Ouch! Lives: ${state.lives}`);
+    }
+  }
+
+  // ====== Boot ===============================================================
+  showMenu(true);
+  requestAnimationFrame(loop);
+  window.addEventListener('pointerdown', ()=>{ audio.init(); }, {once:true});
+})();
+</script>
+</body>
+</html>
